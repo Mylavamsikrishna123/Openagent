@@ -1,266 +1,190 @@
-"""
-LangGraph StateGraph for OpenAgent Browser.
-
-Wires together planner, vision, executor, and self-heal nodes with conditional edges.
-"""
-
 import asyncio
-from typing import Literal, TypedDict, Optional, List, Any
+from typing import List, TypedDict, Literal
 from playwright.async_api import async_playwright, Page
+from langgraph.graph import StateGraph, END, START
 
-from langgraph.graph import StateGraph, END
-from pydantic import BaseModel, Field
+# Import your existing modules
+import sys
+sys.path.insert(0, '.')
+from models import PlannerOutput, VisionAction
+from tools.planner import generate_plan
+from tools.vision import get_vision_action
 
-from src.main import AgentState
-from src.planner_node import plan_task
-from src.gemini_vision import analyze_screen_with_gemini, GeminiAction, SemanticLocator
-from src.execution_node import execute_action
+# --- State Definition ---
+class AgentState(TypedDict):
+    task: str
+    plan: List[str]
+    current_step_index: int
+    history: List[str]
+    retry_count: int
+    error_message: str | None
 
+# --- Nodes ---
 
-# Maximum retries before giving up
-MAX_RETRIES = 3
-
-
-async def vision_node(state: AgentState, page: Page) -> AgentState:
-    """
-    Vision node that analyzes the screen and returns the action plan.
-    Stores the action in state for the executor to use.
-    """
-    objective = state.get("user_task", "")
-    
+async def plan_node(state: AgentState) -> AgentState:
+    """Calls Groq to generate the high-level plan."""
+    print(f"🧠 Planning task: {state['task']}")
     try:
-        action_plan: GeminiAction = await analyze_screen_with_gemini(page, objective)
-        
+        plan_output: PlannerOutput = await generate_plan(state['task'])
         return {
-            **state,
-            "current_action": action_plan.model_dump(),
-            "error": None,
-            "retry_count": 0  # Reset retry count on successful vision analysis
+            "plan": plan_output.steps,
+            "current_step_index": 0,
+            "history": [f"Plan generated: {plan_output.thought_process}"],
+            "retry_count": 0,
+            "error_message": None
         }
     except Exception as e:
         return {
-            **state,
-            "error": str(e),
-            "retry_count": state.get("retry_count", 0) + 1
+            "history": [f"Planning failed: {str(e)}"],
+            "error_message": str(e)
         }
 
+async def execute_node(state: AgentState, page: Page) -> AgentState:
+    current_step_idx = state["current_step_index"]
+    plan = state["plan"]
+    
+    if current_step_idx >= len(plan):
+        print("✅ Plan completed.")
+        return {"history": state["history"] + ["Plan completed"]}
 
-async def self_heal_node(state: AgentState, page: Page) -> AgentState:
-    """
-    Self-healing node that handles failures by retrying vision analysis.
-    If max retries exceeded, marks the task as complete with error.
-    """
-    retry_count = state.get("retry_count", 0)
-    error_msg = state.get("error", "Unknown error")
-    
-    print(f"Self-heal triggered. Retry count: {retry_count}/{MAX_RETRIES}")
-    print(f"Error: {error_msg}")
-    
-    if retry_count >= MAX_RETRIES:
-        print(f"Max retries ({MAX_RETRIES}) exceeded. Aborting.")
+    current_objective = plan[current_step_idx]
+    print(f"👁️  Executing step {current_step_idx + 1}/{len(plan)}: {current_objective}")
+
+    try:
+        vision_action: VisionAction = await get_vision_action(page, current_objective)
+        
+        if vision_action.action == "done":
+            print("🎉 Objective achieved (Gemini signaled 'done').")
+            return {"history": state["history"] + ["Task completed by agent"], "current_step_index": len(plan)}
+
+        locator = None
+        
+        if vision_action.action == "click":
+            locator = page.get_by_role("button", name=vision_action.target_selector)
+            if not await locator.count():
+                locator = page.get_by_text(vision_action.target_selector)
+            if not await locator.count():
+                locator = page.locator(f"text={vision_action.target_selector}")
+            await locator.click(timeout=5000)
+            
+        elif vision_action.action == "type":
+            if not vision_action.value:
+                raise ValueError("Type action requires a 'value'")
+            locator = page.get_by_label(vision_action.target_selector)
+            if not await locator.count():
+                locator = page.get_by_placeholder(vision_action.target_selector)
+            if not await locator.count():
+                locator = page.locator(f"input, textarea")
+            await locator.fill(vision_action.value)
+            
+        elif vision_action.action == "scroll":
+            await page.evaluate("window.scrollBy(0, 500)")
+        elif vision_action.action == "wait":
+            await page.wait_for_timeout(2000)
+
         return {
-            **state,
-            "is_complete": True,
-            "error": f"Max retries exceeded. Last error: {error_msg}"
+            "current_step_index": current_step_idx + 1,
+            "retry_count": 0,
+            "error_message": None,
+            "history": state["history"] + [f"Executed: {vision_action.action} on {vision_action.target_selector}"]
         }
-    
-    # Increment retry count and route back to vision
-    return {
-        **state,
-        "retry_count": retry_count + 1,
-        "error": None  # Clear error so vision can try again
-    }
 
+    except Exception as e:
+        error_msg = str(e)
+        print(f"⚠️ Execution error: {error_msg}")
+        new_retry_count = state["retry_count"] + 1
+        
+        if new_retry_count > 3:
+            print("❌ Max retries reached. Failing step.")
+            return {
+                "current_step_index": current_step_idx + 1,
+                "retry_count": 0,
+                "history": state["history"] + [f"Failed step after 3 retries: {error_msg}"]
+            }
+        
+        return {
+            "retry_count": new_retry_count,
+            "error_message": f"Retry {new_retry_count}: {error_msg}. Look closer at the screen."
+        }
 
-def should_continue_after_vision(state: AgentState) -> Literal["executor", "self_heal"]:
-    """Conditional edge: route to executor if vision succeeded, else self_heal."""
-    if state.get("error"):
-        return "self_heal"
-    return "executor"
+def decide_next(state: AgentState):
+    if state.get("error_message"):
+        if state["retry_count"] <= 3:
+            return "retry"
+        else:
+            return "continue"
+    return "continue"
 
-
-def should_continue_after_executor(state: AgentState) -> Literal["vision", "self_heal", "END"]:
-    """
-    Conditional edge after execution:
-    - If error occurred: route to self_heal
-    - If task appears complete (no more actions needed): route to END
-    - Otherwise: route back to vision for next step
-    """
-    if state.get("error"):
-        return "self_heal"
-    
-    # Check if we should stop (for now, we'll run until error or manual limit)
-    # In a real implementation, you'd check if the objective is achieved
-    step_count = len(state.get("step_results", []))
-    max_steps = 10  # Safety limit
-    
-    if step_count >= max_steps:
-        print(f"Reached max steps ({max_steps}). Stopping.")
+def check_finished(state: AgentState):
+    if state["current_step_index"] >= len(state["plan"]):
         return "END"
-    
-    # Continue loop
-    return "vision"
+    return "execute"
 
+def build_graph():
+    workflow = StateGraph(AgentState)
+    workflow.add_node("plan", plan_node)
+    
+    global browser_page
+    async def execute_wrapper(state: AgentState):
+        return await execute_node(state, browser_page)
 
-def build_graph() -> StateGraph:
-    """Build and compile the LangGraph workflow."""
+    workflow.add_node("execute", execute_wrapper)
+    workflow.add_node("check_done", lambda x: x)
+
+    workflow.add_edge(START, "plan")
+    workflow.add_edge("plan", "execute")
     
-    # Define the graph builder
-    builder = StateGraph(AgentState)
-    
-    # Add nodes (note: we'll pass page via context in the actual run)
-    # For now, we define nodes that accept state only
-    # We'll need to handle page passing differently
-    
-    # Since our nodes need both state and page, we'll create wrapper functions
-    # that close over the page object
-    
-    def make_node_wrapper(async_func):
-        """Create a wrapper that injects the page object."""
-        async def wrapper(state: AgentState):
-            # Page will be passed via graph configuration or global context
-            # For this demo, we assume page is available in the closure
-            return await async_func(state, page)
-        return wrapper
-    
-    # We'll add nodes dynamically when running with a page object
-    # For now, define the structure
-    
-    builder.add_node("planner", make_node_wrapper(plan_task))
-    builder.add_node("vision", make_node_wrapper(vision_node))
-    builder.add_node("executor", make_node_wrapper(execute_action))
-    builder.add_node("self_heal", make_node_wrapper(self_heal_node))
-    
-    # Set entry point
-    builder.set_entry_point("planner")
-    
-    # Add conditional edges
-    builder.add_conditional_edges(
-        source="planner",
-        path=lambda s: "vision",  # Always go to vision after planning
-        target_map=["vision"]
+    workflow.add_conditional_edges(
+        "execute",
+        decide_next,
+        {
+            "retry": "execute",
+            "continue": "check_done"
+        }
     )
     
-    builder.add_conditional_edges(
-        source="vision",
-        path=should_continue_after_vision,
-        target_map=["executor", "self_heal"]
+    workflow.add_conditional_edges(
+        "check_done",
+        check_finished,
+        {
+            "execute": "execute",
+            "END": END
+        }
     )
-    
-    builder.add_conditional_edges(
-        source="executor",
-        path=should_continue_after_executor,
-        target_map=["vision", "self_heal", "END"]
-    )
-    
-    builder.add_conditional_edges(
-        source="self_heal",
-        path=lambda s: "vision" if s.get("retry_count", 0) < MAX_RETRIES else "END",
-        target_map=["vision", "END"]
-    )
-    
-    return builder.compile()
 
+    return workflow.compile()
 
-async def run_agent(objective: str, start_url: str = "https://news.ycombinator.com"):
-    """
-    Main entry point to run the browser agent.
-    
-    Args:
-        objective: The user's task objective
-        start_url: The URL to start from
-    """
+async def main():
+    target_url = "https://news.ycombinator.com"
+    user_task = "Find the title of the top story"
+
     async with async_playwright() as p:
-        # Launch browser (non-headless for visibility during testing)
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
-        page = await context.new_page()
+        global browser_page
+        browser_page = await context.new_page()
         
-        # Navigate to start URL
-        print(f"Navigating to {start_url}...")
-        await page.goto(start_url)
-        await page.wait_for_load_state("networkidle")
+        await browser_page.goto(target_url)
         
-        # Build the graph with page closure
-        def make_node_wrapper(async_func):
-            async def wrapper(state: AgentState):
-                return await async_func(state, page)
-            return wrapper
-        
-        builder = StateGraph(AgentState)
-        builder.add_node("planner", make_node_wrapper(plan_task))
-        builder.add_node("vision", make_node_wrapper(vision_node))
-        builder.add_node("executor", make_node_wrapper(execute_action))
-        builder.add_node("self_heal", make_node_wrapper(self_heal_node))
-        
-        builder.set_entry_point("planner")
-        
-        builder.add_conditional_edges(
-            source="planner",
-            path=lambda s: "vision",
-            target_map=["vision"]
-        )
-        
-        builder.add_conditional_edges(
-            source="vision",
-            path=should_continue_after_vision,
-            target_map=["executor", "self_heal"]
-        )
-        
-        builder.add_conditional_edges(
-            source="executor",
-            path=should_continue_after_executor,
-            target_map=["vision", "self_heal", "END"]
-        )
-        
-        builder.add_conditional_edges(
-            source="self_heal",
-            path=lambda s: "vision" if s.get("retry_count", 0) < MAX_RETRIES else "END",
-            target_map=["vision", "END"]
-        )
-        
-        graph = builder.compile()
-        
-        # Initialize state
-        initial_state: AgentState = {
-            "user_task": objective,
+        initial_state = {
+            "task": user_task,
             "plan": [],
             "current_step_index": 0,
-            "current_url": start_url,
-            "step_results": [],
+            "history": [],
             "retry_count": 0,
-            "error": None,
-            "is_complete": False,
-            "current_action": None
+            "error_message": None
         }
+
+        graph = build_graph()
         
-        print(f"\nStarting agent with objective: {objective}")
-        print("=" * 50)
-        
-        # Run the graph
+        print(f"🚀 Starting Agent for task: '{user_task}'")
         final_state = await graph.ainvoke(initial_state)
         
-        print("\n" + "=" * 50)
-        print("Agent finished!")
-        print(f"Final URL: {final_state.get('current_url')}")
-        print(f"Steps executed: {len(final_state.get('step_results', []))}")
-        if final_state.get("error"):
-            print(f"Error: {final_state['error']}")
-        
-        # Print step history
-        print("\nStep History:")
-        for step in final_state.get("step_results", []):
-            print(f"  Step {step['step']}: {step['action']} - {step['status']}")
-            if step.get("reasoning"):
-                print(f"    Reasoning: {step['reasoning']}")
-        
+        print("\n--- Final History ---")
+        for line in final_state["history"]:
+            print(line)
+            
         await browser.close()
-        
-        return final_state
-
 
 if __name__ == "__main__":
-    # Test the agent on Hacker News
-    test_objective = "Find and click on the first story link titled 'Show HN'"
-    
-    result = asyncio.run(run_agent(test_objective))
+    asyncio.run(main())
