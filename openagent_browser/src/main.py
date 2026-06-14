@@ -133,6 +133,14 @@ class AgentState(TypedDict, total=False):
     final_answer: Optional[str]
     """The final result/answer to return to the user"""
 
+    # Retry mechanism for self-healing
+    retry_count: int
+    """Number of consecutive retries attempted"""
+
+    # Current action from vision (for executor to use)
+    current_action: Optional[dict]
+    """The current action plan from Gemini Vision"""
+
 
 # =============================================================================
 # MAIN ENTRY POINT

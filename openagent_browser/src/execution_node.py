@@ -4,7 +4,7 @@ LangGraph execution node for the OpenAgent Browser.
 This module contains the `execute_action` node which:
 1. Retrieves the current objective from the state.
 2. Calls `analyze_screen_with_gemini` to determine the next UI action.
-3. Executes the action (click or type) using Playwright.
+3. Executes the action (click or type) using Playwright semantic locators.
 4. Waits for network idle.
 5. Updates the state with the result and history.
 """
@@ -38,26 +38,28 @@ async def execute_action(state: AgentState, page: Page) -> AgentState:
         action_plan: GeminiAction = await analyze_screen_with_gemini(page, objective)
         
         action_type = action_plan.action
-        selector = action_plan.target_selector
+        semantic_target = action_plan.target  # Now a SemanticLocator object
         value = action_plan.value
         
         # Prepare log entry for this action
         log_entry: Dict[str, Any] = {
             "step": current_step_index,
             "action": action_type,
-            "target_selector": selector,
+            "target_strategy": semantic_target.strategy,
+            "target_value": semantic_target.value,
             "value": value,
             "reasoning": action_plan.reasoning,
             "status": "pending"
         }
 
-        # 2. Execute the action using Playwright
-        element = page.locator(selector)
+        # 2. Execute the action using Playwright semantic locators
+        element = semantic_target.to_playwright_locator(page)
         
-        # Check if element exists
-        count = await element.count()
-        if count == 0:
-            raise ValueError(f"Element not found for selector: {selector}")
+        # Check if element exists (wait for it with timeout)
+        try:
+            await element.wait_for(state="attached", timeout=5000)
+        except PlaywrightTimeoutError:
+            raise ValueError(f"Element not found: {semantic_target.strategy}='{semantic_target.value}'")
         
         if action_type == "click":
             await element.click()
@@ -102,8 +104,8 @@ async def execute_action(state: AgentState, page: Page) -> AgentState:
         log_entry = {
             "step": current_step_index,
             "action": "error",
-            "target_selector": "N/A",
-            "value": None,
+            "target_strategy": "N/A",
+            "target_value": "N/A",
             "error": error_msg,
             "status": "failed"
         }
