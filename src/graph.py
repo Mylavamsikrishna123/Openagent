@@ -50,9 +50,10 @@ async def execute_node(state: AgentState, page: Page) -> AgentState:
     current_step_idx = state["current_step_index"]
     plan = state["plan"]
     
+    # Check if plan is exhausted or task is done
     if current_step_idx >= len(plan):
         print("✅ Plan completed.")
-        return {"history": state["history"] + ["Plan completed"]}
+        return {"history": state["history"] + ["Plan completed"], "current_step_index": len(plan)}
 
     current_objective = plan[current_step_idx]
     print(f"👁️  Executing step {current_step_idx + 1}/{len(plan)}: {current_objective}")
@@ -65,6 +66,7 @@ async def execute_node(state: AgentState, page: Page) -> AgentState:
             return {"history": state["history"] + ["Task completed by agent"], "current_step_index": len(plan)}
 
         locator = None
+        action_success = False
         
         if vision_action.action == "click":
             locator = page.get_by_role("button", name=vision_action.target_selector)
@@ -72,7 +74,11 @@ async def execute_node(state: AgentState, page: Page) -> AgentState:
                 locator = page.get_by_text(vision_action.target_selector)
             if not await locator.count():
                 locator = page.locator(f"text={vision_action.target_selector}")
-            await locator.click(timeout=5000)
+            if await locator.count():
+                await locator.click(timeout=5000)
+                action_success = True
+            else:
+                raise Exception(f"Element not found: {vision_action.target_selector}")
             
         elif vision_action.action == "type":
             if not vision_action.value:
@@ -81,20 +87,29 @@ async def execute_node(state: AgentState, page: Page) -> AgentState:
             if not await locator.count():
                 locator = page.get_by_placeholder(vision_action.target_selector)
             if not await locator.count():
-                locator = page.locator(f"input, textarea")
-            await locator.fill(vision_action.value)
+                locator = page.locator("input, textarea").first
+            if await locator.count():
+                await locator.fill(vision_action.value)
+                action_success = True
+            else:
+                raise Exception(f"Input element not found: {vision_action.target_selector}")
             
         elif vision_action.action == "scroll":
             await page.evaluate("window.scrollBy(0, 500)")
+            action_success = True
         elif vision_action.action == "wait":
             await page.wait_for_timeout(2000)
+            action_success = True
 
-        return {
-            "current_step_index": current_step_idx + 1,
-            "retry_count": 0,
-            "error_message": None,
-            "history": state["history"] + [f"Executed: {vision_action.action} on {vision_action.target_selector}"]
-        }
+        if action_success:
+            return {
+                "current_step_index": current_step_idx + 1,
+                "retry_count": 0,
+                "error_message": None,
+                "history": state["history"] + [f"Executed: {vision_action.action} on {vision_action.target_selector}"]
+            }
+        else:
+            raise Exception("Action could not be performed")
 
     except Exception as e:
         error_msg = str(e)
@@ -102,16 +117,18 @@ async def execute_node(state: AgentState, page: Page) -> AgentState:
         new_retry_count = state["retry_count"] + 1
         
         if new_retry_count > 3:
-            print("❌ Max retries reached. Failing step.")
+            print("❌ Max retries reached. Skipping step.")
             return {
                 "current_step_index": current_step_idx + 1,
                 "retry_count": 0,
+                "error_message": None,
                 "history": state["history"] + [f"Failed step after 3 retries: {error_msg}"]
             }
         
         return {
             "retry_count": new_retry_count,
-            "error_message": f"Retry {new_retry_count}: {error_msg}. Look closer at the screen."
+            "error_message": f"Retry {new_retry_count}: {error_msg}. Look closer at the screen.",
+            "current_step_index": current_step_idx  # Don't increment on retry
         }
 
 def decide_next(state: AgentState):
