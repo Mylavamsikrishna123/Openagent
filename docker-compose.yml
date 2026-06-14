@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  openagent:
+    build: .
+    container_name: openagent-browser
+    restart: unless-stopped
+    env_file:
+      - .env
+    shm_size: '2gb'
+    volumes:
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 1G
