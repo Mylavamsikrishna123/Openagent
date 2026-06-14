@@ -1,11 +1,18 @@
 import asyncio
 from typing import List, TypedDict, Literal
+from pathlib import Path
+import sys
+
+# Fix Import Paths: Add project root to sys.path so imports work from src/
+current_dir = Path(__file__).resolve().parent
+project_root = current_dir.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 from playwright.async_api import async_playwright, Page
 from langgraph.graph import StateGraph, END, START
 
-# Import your existing modules
-import sys
-sys.path.insert(0, '.')
+# Now imports will work correctly
 from models import PlannerOutput, VisionAction
 from tools.planner import generate_plan
 from tools.vision import get_vision_action
